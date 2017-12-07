@@ -1,0 +1,304 @@
+---
+title: "Spatial Analysis"
+author: "Sameer Darekar"
+date: "6 December 2017"
+output: html_notebook
+---
+#Problem Statement
+Below is a small section of a set of point data representing ~12,000 geocoded businesses in Boston, MA, saved as a flat `.csv` file.
+
+It is organized into the following schema.
+
+```
+name - Business name
+sic - Standard Industry Classification code
+lon - longitude
+lat - latitude
+gh7 - seven digit geohash
+```
+
+[boston_business_data.csv (Google Drive)](https://drive.google.com/open?id=1ZLpotQcA5ZECMY43Wy-SoxWtf0vOUEn9). 
+
+### My task
+
+Answer two questions:
+
+1. Are the points randomly distributed or is there a pattern?
+2. If they're not random, identify clusters of points.
+
+Provide evidence, relevant code, visualizations, that make a case for your answers to each of the questions.    
+
+###1. Reading and Cleaning Data
+
+```{r}
+# WGS84 proj4string
+wgs84 = "+init=epsg:4326"
+
+# load the point data as a dataframe object
+bosbiz.df = read.csv(file = "bosbiz.csv", as.is = T)
+```
+Let us load the dataset into a dataframe
+
+```{r}
+sum(is.na(bosbiz.df$sic))
+```
+After looking at the raw data I found that there are 2939 missing values in the SIC column
+
+```{r}
+bosbiz.df$sic[is.na(bosbiz.df$sic)] <- 0
+```
+As ggplot does not work well with missing values and removes it for us when we plot the data, to avoid this fill the missing values in the sic column with 0
+
+
+```{r}
+sum(duplicated(bosbiz.df))
+```
+The dataset contains 145 duplicate records
+
+```{r}
+bosbiz.df <- bosbiz.df[!duplicated(bosbiz.df),]
+```
+Remove duplicate records     
+**Assumption:** I assume here that duplicate values might affect the clustering hence removing them whereas there might be some cases where duplicate values in dataset are expected
+
+```{r}
+library(sp)
+bosbiz.sp = SpatialPointsDataFrame(coords = bosbiz.df[,c("lon", "lat")], data = bosbiz.df[,1:2], proj4string = CRS(wgs84))
+proj4string(bosbiz.sp)
+```
+Convert the dataframe to a Spatial Points dataframe
+
+```{r}
+summary(bosbiz.sp)
+```
+
+```{r}
+maxLat <- max(bosbiz.df$lat)
+maxLon <- max(bosbiz.df$lon)
+minLat <- min(bosbiz.df$lat)
+minLon <- min(bosbiz.df$lon)
+```
+setting variables for map re-centering
+
+###2. Plotting data on map
+```{r}
+library(ggmap)
+theme_update(plot.title = element_text(hjust = 0.5)) #for bringing title to center
+
+boston.bounds <- c(left = -71.19, bottom = 42.22, right = -70.93, top = 42.45) #got boston bounds from google map
+map <- get_map(boston.bounds, zoom = 12,source="google",maptype="roadmap")
+ggmap(map) + geom_point(data=as.data.frame(bosbiz.df), aes(x=lon, y=lat),alpha=0.2, color="red") +
+  ggtitle("Boston City Map")
+```
+Boston city map with all data, We dont see any point occuring out of the rectange hence no need to remove outliers
+
+```{r}
+#Dynamic bounds with varying color depth as per density
+boston.bounds <- c(left = minLon, bottom = minLat, right = maxLon, top = maxLat)
+map <- get_map(boston.bounds, zoom = 13, scale= 2,source="google",maptype="roadmap")
+ggmap(map) + geom_point(data=as.data.frame(bosbiz.df), aes(x=lon, y=lat), alpha=0.2, color='red') + 
+  ggtitle("Boston Map boundary adjusted")
+
+```
+The data appears to be bounded in a rectangle so let us focus on that rectangle, re-centering the map to the data      
+
+###2. Test for Randomness
+
+Comming to the first Question:    
+Are the points randomly distributed or is there a pattern?    
+If the points were randomly distributed then these points would certainly be in same density in zoo, parks and lakes, but if we see in the map the points are certainly not randomly distributed as we see varying density in the distributions. By naked eye we definately can say that these points are not randomly distributed but let us prove this by hypothesis testing.
+
+```{r}
+library(spatstat)
+library(maptools)
+library(dplyr)
+mat <- select(bosbiz.df, lon, lat)
+bosbiz.pp <- as(bosbiz.sp, "ppp")
+qc <- quadratcount(bosbiz.pp, nx=5)
+plot(mat, pch=".", col="blue")+
+  plot(qc, add=TRUE, col="red", cex=1.5, lty=2)+
+  title('Quadrat count')
+```
+Let us divide the area in which the points are located into 25 quadrats as above and count the numbers of points falling into each quadrat. Quadrat counting is a rudimentary technique for analysing spatial point patterns. We can observe that there is significant amount of difference in the number of point located in each quadrat.
+
+```{r}
+test <- quadrat.test(qc)
+test
+```
+
+let us do a Chi-squared test for Complete Spatial Randomness(CSR). Test statistics of chi-squared distribution arise from an assumption of independent normally distributed data. We use this test to attempt rejection of the null hypothesis that the data are independent.     
+The small p-value suggests that this data set was not generated under CSR hence it indicates significant amount of dependence or clustering.
+
+```{r}
+qc <- quadratcount(bosbiz.pp, nx=10)
+test <- quadrat.test(qc)
+test
+```
+Let us repeat this test with more number of Quadrats just to be sure. The result seems to be unchanged.     
+
+Hence we can come to a conclusion that the data is definately not randomly distributed.    
+
+###4. Clustering    
+####4.1. Density based clustering
+As we saw in the map the points are not uniformly distributed and there are patches of high density and low density hence Density based clustering seems to be the best approach rather than K means clustering as the basic assumption for K means clustering is that the clusters are globular in shape.
+
+#####4.1.1. DBSCAN
+we will use Density-based spatial clustering of applications with noise(DBSCAN) clustering. This algorithm groups points which are near and marks other as outliers which are not near. In DBSCAN there are basically two parameters to be tuned     
+1. $\epsilon$(eps); the maximum distance between two points for cluster membership and     
+2. minPts(minimum points): The number of minimum point in $\epsilon$ region   
+
+There is no general way of chosing minPts if it is less than it will build more clusters from noise and if we choose a large value it will classify more points as noise hence we can find this by trial and error.    
+For $\epsilon$ it again comes down to what works for this dataset, but the general technique used is to find the K-Nearest Neighbor(KNN) distance histogram, k-distances are plotted in an ascending order and we take y axis value coresponding to the knee of the plot as an eps value. A knee corresponds to a threshold where a sharp change occurs along the k-distance curve.     
+
+Note the DBSCAN algorithm in R just takes into consideration the euclidean distance and it is not the actual geographical distance as the earth is spherical in shape. So we need to get the distance matrix of points and then use DBSCAN
+
+```{r}
+library(geosphere)
+#Reference:https://cran.r-project.org/web/packages/geosphere/geosphere.pdf
+mdist <- distm(bosbiz.sp, fun = distGeo)
+#distm function gives distance in meters converting it to km for simplicity
+mdist <- mdist/1000
+```
+distGeo metric is Highly accurate estimate of the shortest distance between two points on an ellipsoid (default is WGS84 ellipsoid). 
+```{r}
+library(dbscan)
+#getting optimal eps
+dbscan::kNNdistplot(mdist, k = 6)+
+  abline(h = 9, lty = 3)+
+  title("Optimal value of Epsilon for DBSCAN using KNN for k=6")
+```
+The optimal value of eps seems to be 9 in this case, hence using it in dbscan algorithm.
+
+```{r}
+clusters.actual <- dbscan(mdist, eps=9, minPts = 6)
+clusters.actual
+```
+
+```{r}
+library(ggmap)
+ggmap(map)+ 
+  geom_point(aes(x=lon, y=lat), data=mat, col = clusters.actual$cluster + 1, alpha=0.5, pch = 20)+
+  ggtitle("Boston Map with DBSCAN Clusters")
+```
+Visualizing  clusters in this map is difficult hence let us focus only on clusters in a hullplot forming convex cluster hulls as shown below.
+
+```{r}
+hullplot(mat, clusters.actual$cluster,  main="DBSCAN clustering(eps=9, minPts=6) with noise", 
+         alpha=0.2,pch=clusters.actual$cluster%%25)
+
+```
+##### Comparing DBSCAN for Euclidean and Geodetic distances
+
+```{r}
+dbscan::kNNdistplot(mat, k = 6)+
+  abline(h = 0.0015, lty = 3)+
+  title("Optimal value of Epsilon for DBSCAN(using euclidean) using KNN(k=6)")
+```
+
+```{r}
+clusters.euclid <- dbscan(mat, eps=0.0015, minPts = 6)
+hullplot(mat, clusters.euclid$cluster,  main="DBSCAN clustering(eps=0.0015, minPts=6) with noise(Euclidean)", 
+         alpha=0.2,pch=clusters.actual$cluster%%25)
+```
+We see that even after getting the optimal eps value using KNN the clusters formed are differenct than that formed using actual geographic distance, hence we can say that the inter point distance does matter in DBSCAN
+
+We can also observe that there are various clusters having various densities. As Clustering is a hard problem and we can never say how many numbers of clusters are optimal and how many are not, hence we need to try with multiple values with geodetic distances
+
+
+```{r}
+library(dbscan)
+dbscan::kNNdistplot(mdist, k = 8)+
+  abline(h = 10, lty = 3)+
+  title("Optimal value of Epsilon for DBSCAN using KNN for k=8")
+```
+let us try for minPts value of 8   
+
+```{r}
+clusters.8 <- dbscan(mdist, eps=10, minPts = 8)
+hullplot(mat, clusters.8$cluster,  main="DBSCAN clustering(eps= 10, minPts=8) with noise", 
+         alpha=0.2,, pch=clusters.8$cluster%%25)
+```
+
+```{r}
+dbscan::kNNdistplot(mdist, k = 10)+
+  abline(h = 11, lty = 3)+
+  title("Optimal value of Epsilon for DBSCAN using KNN for k=10")
+```
+let us try for minPts value of 10.   
+
+```{r}
+clusters.10 <- dbscan(mdist, eps=11, minPts = 10)
+hullplot(mat, clusters.10$cluster,  main="DBSCAN clustering(eps= 11, minPts=10) with noise", 
+         alpha=0.2, pch=clusters.10$cluster%%25)
+```
+
+
+#####4.1.2. OPTICS    
+Ordering points to identify the clustering structure(OPTICS) is a similar algorithm to DBSCAN. OPTICS is based on a very clever idea that instead of fixing MinPts and the Radius, we only fix minPts, and plot the radius at which an object would be considered dense by DBSCAN. Naively, we can imagine OPTICS as doing all values of Epsilon at the same time, and putting the results in a cluster hierarchy.    
+
+```{r}
+#Run OPTICS
+opt <- optics(mdist, eps=15, minPts = 6)
+#Extract DBSCAN-like clustering from OPTICS and create a reachability plot (extracted DBSCAN clusters at eps_cl=9 are colored)
+opt <- extractDBSCAN(opt, eps_cl = 9)
+opt
+```
+
+```{r}
+plot(opt)
+```
+The Horizontal line is the threshold for DBSCAN. The bars with colors are the clusters found by DBSCAN and the ones in black were identified as noise.   
+This link shows a good diagram of OPTICS clustering generated by ELKI https://commons.wikimedia.org/wiki/File%3aOPTICS.svg
+
+####4.2. K- Means clustering
+
+The k-means algorithm groups all observations (i.e., rows in an array of coordinates) into k clusters. However, k-means is not an ideal algorithm for latitude-longitude spatial data because it minimizes variance, not geodetic distance. There is substantial distortion at latitudes far from the equator, like those of this data set. The algorithm would still “work” but its results are poor and there isn’t much that can be done to improve them.
+
+Note: Due to computation power limitations I have used euclidean distance as the distance matrix takes huge amount of space.
+
+```{r}
+clusters.kmeans <- kmeans(mat, 6)
+hullplot(mat, clusters.kmeans$cluster,  main="K-Means clustering(Euclidean)", 
+         alpha=0.2, pch=clusters.10$cluster%%25)
+```
+As we see the clusters are trying to be globular in shape. the Pink and the yellow clusters are dense and DBSCAN generally combines them. Let us try with more number of clusters
+
+
+
+```{r}
+clusters.kmeans <- kmeans(mat, 50)
+hullplot(mat, clusters.kmeans$cluster, main="K-Means clustering(Euclidean)", 
+         alpha=0.2, pch=clusters.10$cluster%%25)
+```
+Hence we can say that K-means clustering is not suitable for spatial data as it ignores density.    
+
+####4.3. Heirarchical Clustering
+It is a bootom up(Agglomerative) clustering technique, initally each object is assigned to a cluster and then depending upon the similarity of the clusters two clusters are merged using greedy approach
+
+```{r}
+hclusters <- hclust(as.dist(mdist))
+plot(hclusters)+
+  abline(h=4, lty=2)
+```
+Above is a dendogram for the clusters formed we can see that many small clusters are combined to form a big one let us cut the tree at two arbitrary number of clusters say 6 and 40 the hullplot for them is as shown below
+
+```{r}
+library(dbscan)
+hclusterCut <- cutree(hclusters, 6)
+hullplot(mat, hclusterCut, main="Hierarchical clustering for 6", 
+         alpha=0.2, pch=hclusterCut%%25)
+```
+```{r}
+hclusterCut <- cutree(hclusters, 40)
+hullplot(mat, hclusterCut, main="Hierarchical clustering for 13 clusters", 
+         alpha=0.2, pch=hclusterCut%%25)
+```
+Comparing this to density based clustering approaches we can say that this is not better than the density based approaches as we see that dense points are seperated in other clusters which does not make much sense in spatial data.
+
+###5. Conclusion
+After having a look at multiple kinds of clustering for the same spatial data we can say that density based clustering suits well for spatial data. The main objective of spatial clustering is to find patterns in data with respect to its locational significance.   
+
+Morover, it can be observed that a perfect clustering algorithm which comprehends all the issues with the dataset is an idealistic notion.    
+
+Further analysis can be done based on SIC codes but there are not much points in individual SIC in the given dataset hence limiting it here.
+
